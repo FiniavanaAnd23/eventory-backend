@@ -1,0 +1,987 @@
+// schema.prisma — Plateforme SaaS de gestion de salles, réservations et événements
+// Stack : PostgreSQL + Prisma. Multi-tenant par organizationId.
+// Montants en unités mineures (Int) + devise ISO. Instants en UTC, fuseau IANA sur Venue.
+// Unités de plan en centimètres.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ════════════════════════════════════════════════════════════
+// ENUMS
+// ════════════════════════════════════════════════════════════
+
+enum PlatformRole {
+  USER
+  ADMIN
+  SUPERADMIN
+}
+
+enum OrgRole {
+  OWNER
+  MANAGER
+  STAFF
+}
+
+enum AccountStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+}
+
+enum BookingStatus {
+  REQUESTED
+  HELD
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+}
+
+enum EventStatus {
+  DRAFT
+  PREPARING
+  PUBLISHED
+  DONE
+  ARCHIVED
+}
+
+enum FloorPlanMode {
+  SIMPLE
+  FREE_DRAW
+}
+
+enum FloorPlanStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum FloorElementType {
+  WALL
+  DOOR
+  WINDOW
+  PILLAR
+  ZONE
+  TABLE
+  CHAIR
+  STAGE
+  DANCE_FLOOR
+  BUFFET
+  BAR
+  ENTRANCE
+  EXIT
+  CUSTOM
+}
+
+enum FurnitureShape {
+  ROUND
+  RECTANGLE
+  SQUARE
+  OVAL
+  POLYGON
+  LINE
+}
+
+enum GuestPlacementMode {
+  TABLE
+  SEAT
+  MIXED
+}
+
+enum GuestAssignmentStatus {
+  ASSIGNED
+  UNASSIGNED
+  CANCELLED
+}
+
+enum RsvpStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+}
+
+enum ProviderBookingStatus {
+  PROPOSED
+  CONFIRMED
+  DECLINED
+  CANCELLED
+}
+
+enum ConversationType {
+  DIRECT
+  BOOKING
+  SUPPORT
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  PUSH
+}
+
+enum EmailStatus {
+  QUEUED
+  SENT
+  FAILED
+  BOUNCED
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PAID
+  VOID
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+enum AttachmentKind {
+  CONTRACT
+  PLAN_PDF
+  GUEST_IMPORT
+  PHOTO
+  OTHER
+}
+
+// ════════════════════════════════════════════════════════════
+// COMPTES, ORGANISATIONS, RÔLES
+// ════════════════════════════════════════════════════════════
+
+model User {
+  id            String        @id @default(cuid())
+  email         String        @unique
+  passwordHash  String?
+  firstName     String
+  lastName      String
+  phone         String?
+  avatarUrl     String?
+  locale        String        @default("fr")
+  timezone      String        @default("UTC")
+  platformRole  PlatformRole  @default(USER)
+  status        AccountStatus @default(ACTIVE)
+  emailVerified DateTime?
+  lastLoginAt   DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  deletedAt     DateTime?
+
+  memberships     Membership[]
+  invitationsSent Invitation[]
+  refreshTokens   RefreshToken[]
+  providerProfile ProviderProfile?
+  customers       Customer[]
+  bookingsCreated Booking[]                @relation("BookingCreatedBy")
+  participants    ConversationParticipant[]
+  messages        Message[]
+  notifications   Notification[]
+  favorites       FavoriteVenue[]
+  reviews         Review[]
+  attachments     Attachment[]
+  auditLogs       AuditLog[]
+
+  @@index([platformRole])
+  @@index([status])
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  userAgent String?
+  ip        String?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Organization {
+  id        String        @id @default(cuid())
+  name      String
+  slug      String        @unique
+  status    AccountStatus @default(ACTIVE)
+  country   String?
+  currency  String        @default("EUR")
+  locale    String        @default("fr")
+  timezone  String        @default("UTC")
+  settings  Json?
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  deletedAt DateTime?
+
+  subscription  Subscription?
+  memberships   Membership[]
+  invitations   Invitation[]
+  venues        Venue[]
+  customers     Customer[]
+  bookings      Booking[]
+  events        Event[]
+  guests        Guest[]
+  floorPlans    FloorPlan[]
+  eventPlans    EventFloorPlan[]
+  eventProviders EventProvider[]
+  invoices      Invoice[]
+  payments      Payment[]
+  attachments   Attachment[]
+  closures      RoomClosure[]
+  auditLogs     AuditLog[]
+}
+
+// Propriétaire de salle = User + Membership(OWNER)
+model Membership {
+  id             String   @id @default(cuid())
+  userId         String
+  organizationId String
+  role           OrgRole  @default(STAFF)
+  permissions    Json?    // surcharges fines éventuelles
+  createdAt      DateTime @default(now())
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+}
+
+model Invitation {
+  id             String    @id @default(cuid())
+  organizationId String
+  email          String
+  role           OrgRole   @default(STAFF)
+  tokenHash      String    @unique
+  invitedById    String
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  createdAt      DateTime  @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  invitedBy    User         @relation(fields: [invitedById], references: [id])
+
+  @@index([organizationId, email])
+}
+
+// ════════════════════════════════════════════════════════════
+// ABONNEMENT SAAS
+// ════════════════════════════════════════════════════════════
+
+model Plan {
+  id            String  @id @default(cuid())
+  code          String  @unique // free, pro, business
+  name          String
+  priceMinor    Int
+  currency      String  @default("EUR")
+  maxVenues     Int?
+  maxRooms      Int?
+  maxGuestsPerEvent Int?
+  features      Json?
+  active        Boolean @default(true)
+
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id                 String             @id @default(cuid())
+  organizationId     String             @unique
+  planId             String
+  status             SubscriptionStatus @default(TRIALING)
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+  externalId         String?            // id Stripe ou autre
+  cancelledAt        DateTime?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  plan         Plan         @relation(fields: [planId], references: [id])
+}
+
+// ════════════════════════════════════════════════════════════
+// LIEUX, SALLES, DISPONIBILITÉ
+// ════════════════════════════════════════════════════════════
+
+model Venue {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  slug           String
+  description    String?
+  addressLine1   String
+  addressLine2   String?
+  city           String?
+  postalCode     String?
+  countryCode    String?
+  latitude       Float
+  longitude      Float
+  timezone       String   @default("UTC")
+  phone          String?
+  email          String?
+  website        String?
+  isPublished    Boolean  @default(false) // visible dans la recherche publique
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  deletedAt      DateTime?
+
+  organization  Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  rooms         Room[]
+  images        VenueImage[]
+  favorites     FavoriteVenue[]
+  reviews       Review[]
+  conversations Conversation[]
+
+  @@unique([organizationId, slug])
+  @@index([organizationId])
+  @@index([isPublished, city])
+  @@index([latitude, longitude])
+  // PostGIS : voir notes en fin de fichier
+}
+
+model VenueImage {
+  id        String   @id @default(cuid())
+  venueId   String
+  url       String
+  alt       String?
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  venue Venue @relation(fields: [venueId], references: [id], onDelete: Cascade)
+
+  @@index([venueId, position])
+}
+
+model Amenity {
+  id    String @id @default(cuid())
+  code  String @unique // wifi, parking, sound-system, kitchen...
+  label String
+
+  rooms Room[]
+}
+
+model Room {
+  id            String   @id @default(cuid())
+  venueId       String
+  name          String
+  description   String?
+  capacity      Int
+  widthCm       Decimal? @db.Decimal(10, 2)
+  lengthCm      Decimal? @db.Decimal(10, 2)
+  hourlyPriceMinor Int?
+  dailyPriceMinor  Int?
+  currency      String?
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  deletedAt     DateTime?
+
+  venue      Venue         @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  amenities  Amenity[]
+  bookings   Booking[]
+  floorPlans FloorPlan[]
+  closures   RoomClosure[]
+
+  @@index([venueId])
+}
+
+// Blocage manuel (maintenance, fermeture)
+model RoomClosure {
+  id             String   @id @default(cuid())
+  organizationId String
+  roomId         String
+  startAt        DateTime
+  endAt          DateTime
+  reason         String?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  room         Room         @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@index([roomId, startAt, endAt])
+}
+
+// ════════════════════════════════════════════════════════════
+// CLIENTS, RÉSERVATIONS, ÉVÉNEMENTS
+// ════════════════════════════════════════════════════════════
+
+// Contact d'une organisation, éventuellement lié à un compte User
+model Customer {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String?
+  firstName      String
+  lastName       String
+  companyName    String?
+  email          String?
+  phone          String?
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  deletedAt      DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  bookings     Booking[]
+  invoices     Invoice[]
+
+  @@index([organizationId])
+  @@index([organizationId, email])
+}
+
+model Booking {
+  id             String        @id @default(cuid())
+  organizationId String
+  roomId         String
+  customerId     String
+  createdById    String?
+  status         BookingStatus @default(REQUESTED)
+  startAt        DateTime
+  endAt          DateTime
+  holdExpiresAt  DateTime?
+  guestCount     Int?
+  totalMinor     Int?
+  currency       String?
+  notes          String?
+  source         String?       // staff, public-form, marketplace
+  cancelledAt    DateTime?
+  cancelReason   String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  organization  Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  room          Room           @relation(fields: [roomId], references: [id])
+  customer      Customer       @relation(fields: [customerId], references: [id])
+  createdBy     User?          @relation("BookingCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  event         Event?
+  invoices      Invoice[]
+  conversations Conversation[]
+  attachments   Attachment[]
+
+  @@index([organizationId, status])
+  @@index([roomId, startAt, endAt])
+  @@index([customerId])
+  // Anti-chevauchement : contrainte d'exclusion SQL (voir notes en fin de fichier)
+}
+
+// Informations opérationnelles liées à une réservation (1:1)
+model Event {
+  id             String             @id @default(cuid())
+  organizationId String
+  bookingId      String             @unique
+  name           String
+  type           String?            // mariage, conférence, anniversaire...
+  status         EventStatus        @default(DRAFT)
+  placementMode  GuestPlacementMode @default(TABLE)
+  expectedGuests Int?
+  notes          String?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  booking      Booking          @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  guests       Guest[]
+  plans        EventFloorPlan[]
+  assignments  GuestAssignment[]
+  providers    EventProvider[]
+  attachments  Attachment[]
+
+  @@index([organizationId, status])
+}
+
+model Guest {
+  id             String     @id @default(cuid())
+  organizationId String
+  eventId        String
+  firstName      String
+  lastName       String
+  email          String?
+  phone          String?
+  groupName      String?    // famille, entreprise...
+  dietaryNotes   String?
+  notes          String?
+  rsvp           RsvpStatus @default(PENDING)
+  checkedInAt    DateTime?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  event        Event             @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  assignment   GuestAssignment?
+
+  @@index([organizationId])
+  @@index([eventId, groupName])
+  @@index([eventId, lastName])
+}
+
+// ════════════════════════════════════════════════════════════
+// PLANS DE SALLE — MODÈLES RÉUTILISABLES
+// ════════════════════════════════════════════════════════════
+
+model FloorPlan {
+  id             String          @id @default(cuid())
+  organizationId String
+  roomId         String
+  name           String
+  mode           FloorPlanMode   @default(SIMPLE)
+  status         FloorPlanStatus @default(DRAFT)
+  widthCm        Decimal         @db.Decimal(10, 2)
+  heightCm       Decimal         @db.Decimal(10, 2)
+  gridSizeCm     Decimal?        @db.Decimal(10, 2)
+  boundary       Json?           // contour libre (points) en mode FREE_DRAW
+  version        Int             @default(1)
+  isTemplate     Boolean         @default(true)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  archivedAt     DateTime?
+
+  organization Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  room         Room               @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  elements     FloorPlanElement[]
+  eventPlans   EventFloorPlan[]
+
+  @@index([organizationId, roomId])
+}
+
+model FloorPlanElement {
+  id            String           @id @default(cuid())
+  floorPlanId   String
+  type          FloorElementType
+  name          String?
+  displayNumber String?
+  shape         FurnitureShape?
+  xCm           Decimal          @db.Decimal(10, 2)
+  yCm           Decimal          @db.Decimal(10, 2)
+  widthCm       Decimal?         @db.Decimal(10, 2)
+  heightCm      Decimal?         @db.Decimal(10, 2)
+  rotationDeg   Decimal          @default(0) @db.Decimal(6, 2)
+  capacity      Int?
+  theme         Json?
+  geometry      Json?
+  properties    Json?
+  zIndex        Int              @default(0)
+  locked        Boolean          @default(false)
+
+  floorPlan FloorPlan @relation(fields: [floorPlanId], references: [id], onDelete: Cascade)
+
+  @@index([floorPlanId, type])
+}
+
+// ════════════════════════════════════════════════════════════
+// PLANS D'ÉVÉNEMENT — INSTANTANÉS INDÉPENDANTS DU MODÈLE
+// ════════════════════════════════════════════════════════════
+
+model EventFloorPlan {
+  id               String   @id @default(cuid())
+  organizationId   String
+  eventId          String
+  sourceFloorPlanId String?
+  name             String
+  widthCm          Decimal  @db.Decimal(10, 2)
+  heightCm         Decimal  @db.Decimal(10, 2)
+  boundary         Json?
+  layout           Json?    // éléments non-tables : murs, portes, zones, scène...
+  version          Int      @default(1) // verrou optimiste (expectedVersion)
+  publishedAt      DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  event        Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  source       FloorPlan?   @relation(fields: [sourceFloorPlanId], references: [id], onDelete: SetNull)
+  tables       EventTable[]
+  assignments  GuestAssignment[]
+
+  @@index([organizationId, eventId])
+}
+
+model EventTable {
+  id               String          @id @default(cuid())
+  eventFloorPlanId String
+  name             String?
+  displayNumber    String?
+  shape            FurnitureShape  @default(ROUND)
+  capacity         Int
+  xCm              Decimal         @db.Decimal(10, 2)
+  yCm              Decimal         @db.Decimal(10, 2)
+  widthCm          Decimal         @db.Decimal(10, 2)
+  heightCm         Decimal         @db.Decimal(10, 2)
+  rotationDeg      Decimal         @default(0) @db.Decimal(6, 2)
+  theme            Json?
+  locked           Boolean         @default(false)
+
+  eventFloorPlan EventFloorPlan   @relation(fields: [eventFloorPlanId], references: [id], onDelete: Cascade)
+  seats          EventSeat[]
+  assignments    GuestAssignment[]
+
+  @@index([eventFloorPlanId])
+}
+
+model EventSeat {
+  id          String  @id @default(cuid())
+  tableId     String
+  label       String
+  position    Int     @default(0)
+  xCm         Decimal @db.Decimal(10, 2)
+  yCm         Decimal @db.Decimal(10, 2)
+  rotationDeg Decimal @default(0) @db.Decimal(6, 2)
+
+  table      EventTable       @relation(fields: [tableId], references: [id], onDelete: Cascade)
+  assignment GuestAssignment?
+
+  @@index([tableId, position])
+}
+
+// Une seule affectation active par invité et par événement ; un siège = un invité
+model GuestAssignment {
+  id               String                @id @default(cuid())
+  eventId          String
+  eventFloorPlanId String
+  guestId          String                @unique
+  tableId          String?
+  seatId           String?               @unique
+  status           GuestAssignmentStatus @default(ASSIGNED)
+  createdAt        DateTime              @default(now())
+  updatedAt        DateTime              @updatedAt
+
+  event          Event          @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  eventFloorPlan EventFloorPlan @relation(fields: [eventFloorPlanId], references: [id], onDelete: Cascade)
+  guest          Guest          @relation(fields: [guestId], references: [id], onDelete: Cascade)
+  table          EventTable?    @relation(fields: [tableId], references: [id], onDelete: SetNull)
+  seat           EventSeat?     @relation(fields: [seatId], references: [id], onDelete: SetNull)
+
+  @@index([eventId])
+  @@index([tableId])
+  // CHECK (tableId IS NOT NULL OR seatId IS NOT NULL) : voir notes en fin de fichier
+}
+
+// ════════════════════════════════════════════════════════════
+// PRESTATAIRES
+// ════════════════════════════════════════════════════════════
+
+model ServiceCategory {
+  id       String            @id @default(cuid())
+  slug     String            @unique // catering, dj, decoration, photo...
+  name     String
+  services ProviderService[]
+}
+
+model ProviderProfile {
+  id          String        @id @default(cuid())
+  userId      String        @unique
+  displayName String
+  description String?
+  phone       String?
+  website     String?
+  status      AccountStatus @default(PENDING) // validation par un admin
+  baseLat     Float?
+  baseLng     Float?
+  radiusKm    Int?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  user     User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  services ProviderService[]
+  events   EventProvider[]
+  reviews  Review[]
+
+  @@index([status])
+}
+
+model ProviderService {
+  id         String   @id @default(cuid())
+  providerId String
+  categoryId String
+  title      String
+  description String?
+  priceFromMinor Int?
+  currency   String?
+
+  provider ProviderProfile @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  category ServiceCategory @relation(fields: [categoryId], references: [id])
+
+  @@index([providerId])
+  @@index([categoryId])
+}
+
+// Prestataire engagé sur un événement
+model EventProvider {
+  id             String                @id @default(cuid())
+  organizationId String
+  eventId        String
+  providerId     String
+  status         ProviderBookingStatus @default(PROPOSED)
+  agreedMinor    Int?
+  currency       String?
+  notes          String?
+  createdAt      DateTime              @default(now())
+
+  organization Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  event        Event           @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  provider     ProviderProfile @relation(fields: [providerId], references: [id])
+
+  @@unique([eventId, providerId])
+  @@index([organizationId])
+}
+
+// ════════════════════════════════════════════════════════════
+// RECHERCHE PUBLIQUE : FAVORIS, AVIS
+// ════════════════════════════════════════════════════════════
+
+model FavoriteVenue {
+  userId    String
+  venueId   String
+  createdAt DateTime @default(now())
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  venue Venue @relation(fields: [venueId], references: [id], onDelete: Cascade)
+
+  @@id([userId, venueId])
+  @@index([venueId])
+}
+
+// Avis sur une salle OU un prestataire (l'un des deux renseigné)
+model Review {
+  id         String   @id @default(cuid())
+  userId     String
+  venueId    String?
+  providerId String?
+  rating     Int      // 1..5 (CHECK en SQL)
+  comment    String?
+  createdAt  DateTime @default(now())
+
+  user     User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  venue    Venue?           @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  provider ProviderProfile? @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([venueId])
+  @@index([providerId])
+}
+
+// ════════════════════════════════════════════════════════════
+// CHAT
+// ════════════════════════════════════════════════════════════
+
+model Conversation {
+  id        String           @id @default(cuid())
+  type      ConversationType @default(DIRECT)
+  bookingId String?
+  venueId   String?
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  booking      Booking?                  @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  venue        Venue?                    @relation(fields: [venueId], references: [id], onDelete: SetNull)
+  participants ConversationParticipant[]
+  messages     Message[]
+
+  @@index([bookingId])
+  @@index([venueId])
+}
+
+model ConversationParticipant {
+  conversationId String
+  userId         String
+  lastReadAt     DateTime?
+  joinedAt       DateTime  @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([conversationId, userId])
+  @@index([userId])
+}
+
+model Message {
+  id             String    @id @default(cuid())
+  conversationId String
+  senderId       String
+  body           String
+  attachmentUrl  String?
+  createdAt      DateTime  @default(now())
+  editedAt       DateTime?
+  deletedAt      DateTime?
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User         @relation(fields: [senderId], references: [id])
+
+  @@index([conversationId, createdAt])
+}
+
+// ════════════════════════════════════════════════════════════
+// NOTIFICATIONS & MAILING
+// ════════════════════════════════════════════════════════════
+
+model Notification {
+  id        String              @id @default(cuid())
+  userId    String
+  channel   NotificationChannel @default(IN_APP)
+  type      String              // BOOKING_CONFIRMED, NEW_MESSAGE...
+  payload   Json?
+  readAt    DateTime?
+  createdAt DateTime            @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+}
+
+model EmailTemplate {
+  id        String   @id @default(cuid())
+  key       String   // booking-confirmed, welcome, new-message...
+  locale    String   @default("fr")
+  subject   String
+  bodyHtml  String
+  updatedAt DateTime @updatedAt
+
+  @@unique([key, locale])
+}
+
+model EmailLog {
+  id          String      @id @default(cuid())
+  userId      String?
+  toEmail     String
+  templateKey String
+  status      EmailStatus @default(QUEUED)
+  error       String?
+  providerId  String?     // id renvoyé par Resend/Brevo/SES
+  createdAt   DateTime    @default(now())
+
+  @@index([userId])
+  @@index([status])
+}
+
+// ════════════════════════════════════════════════════════════
+// FACTURATION, DOCUMENTS, AUDIT
+// ════════════════════════════════════════════════════════════
+
+model Invoice {
+  id             String        @id @default(cuid())
+  organizationId String
+  customerId     String
+  bookingId      String?
+  number         String
+  status         InvoiceStatus @default(DRAFT)
+  totalMinor     Int
+  currency       String
+  issuedAt       DateTime?
+  dueAt          DateTime?
+  createdAt      DateTime      @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customer     Customer     @relation(fields: [customerId], references: [id])
+  booking      Booking?     @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  payments     Payment[]
+
+  @@unique([organizationId, number])
+  @@index([customerId])
+}
+
+model Payment {
+  id             String        @id @default(cuid())
+  organizationId String
+  invoiceId      String
+  status         PaymentStatus @default(PENDING)
+  amountMinor    Int
+  currency       String
+  method         String?
+  externalId     String?       // id du prestataire de paiement
+  paidAt         DateTime?
+  createdAt      DateTime      @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  invoice      Invoice      @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  @@index([externalId])
+}
+
+// Fichiers privés (stockage objet) : accès par URL signée courte
+model Attachment {
+  id             String         @id @default(cuid())
+  organizationId String
+  uploadedById   String?
+  bookingId      String?
+  eventId        String?
+  kind           AttachmentKind @default(OTHER)
+  fileName       String
+  mimeType       String
+  sizeBytes      Int
+  storageKey     String         @unique
+  createdAt      DateTime       @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  uploadedBy   User?        @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+  booking      Booking?     @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  event        Event?       @relation(fields: [eventId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId])
+}
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String?
+  actorId        String?
+  action         String   // ROLE_CHANGED, PLAN_PUBLISHED, EXPORT_PDF...
+  entityType     String
+  entityId       String?
+  metadata       Json?
+  ip             String?
+  createdAt      DateTime @default(now())
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  actor        User?         @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@index([actorId])
+  @@index([entityType, entityId])
+}
+
+// ════════════════════════════════════════════════════════════
+// NOTES POUR LES MIGRATIONS SQL (à ajouter dans le fichier migration.sql
+// généré par `prisma migrate dev --create-only`)
+// ════════════════════════════════════════════════════════════
+//
+// 1) Anti-double réservation (réservations actives uniquement) :
+//    CREATE EXTENSION IF NOT EXISTS btree_gist;
+//    ALTER TABLE "Booking" ADD CONSTRAINT booking_no_overlap
+//      EXCLUDE USING gist (
+//        "roomId" WITH =,
+//        tstzrange("startAt", "endAt", '[)') WITH &&
+//      ) WHERE (status IN ('HELD','CONFIRMED'));
+//    ALTER TABLE "Booking" ADD CONSTRAINT booking_dates_valid CHECK ("endAt" > "startAt");
+//
+// 2) Recherche géographique (PostGIS) :
+//    CREATE EXTENSION IF NOT EXISTS postgis;
+//    ALTER TABLE "Venue" ADD COLUMN geog geography(Point, 4326)
+//      GENERATED ALWAYS AS (ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography) STORED;
+//    CREATE INDEX venue_geog_idx ON "Venue" USING GIST (geog);
+//
+// 3) Affectation : au moins une cible
+//    ALTER TABLE "GuestAssignment" ADD CONSTRAINT assignment_target
+//      CHECK ("tableId" IS NOT NULL OR "seatId" IS NOT NULL);
+//
+// 4) Avis : une seule cible, note 1..5
+//    ALTER TABLE "Review" ADD CONSTRAINT review_one_target
+//      CHECK (("venueId" IS NOT NULL) <> ("providerId" IS NOT NULL));
+//    ALTER TABLE "Review" ADD CONSTRAINT review_rating CHECK (rating BETWEEN 1 AND 5);
+//
+// 5) Isolation multi-tenant : toujours dériver organizationId du contexte
+//    authentifié (guard NestJS), jamais du body ; envisager Row Level Security.
